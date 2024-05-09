@@ -1,0 +1,209 @@
+#!/usr/bin/env ruby
+
+# scrape_<JOBSITE> v.2.0.5
+# Scraping the 5000 newest apprentice jobs and salaries from <JOBSITE>
+# Performes data sanitation and data normalization to eliminate and unify all variants of job names,
+# gender information, plurals, etc. so to be able to cluster and sort the data.
+# Saving result in CSV
+
+require 'nokogiri'
+require 'open-uri'
+require 'csv'
+require 'securerandom'
+
+TITLE_SANITATION_RULES = {
+  # The order matters! Ruby 1.9 (2007-12-24) or newer required to support ordered hashes
+
+  # Removing gender
+  /\(?m\/w\/d\)?/i => '', # (m/w/d), m/w/d
+  /\(?w\/m\/d\)?/i => '', # (w/m/d), w/m/d
+  /\(mensch\)/i => '', # (mensch)
+  /leute/ => 'mann', # leute
+  /Kaufmann\s*\/\s*Kauffrau/ => 'Kaufmann', # Kaufmann / Kauffrau
+  /Kauffrau\s*\/\s*Kaufmann/ => 'Kaufmann', # Bankkauffrau / Bankkaufmann
+  /Bankkaufmann\s*\/\s*Bankkauffrau/ => 'Bankkaufmann', # Kaufmann / Kauffrau
+  /Bankkauffrau\s*\/\s*Bankkaufmann/ => 'Bankkaufmann', # Kauffrau / Kaufmann
+  /zur Bankkauffrau\s*\/\s*zum Bankkaufmann/ => 'Bankkaufmann', # zur Bankkauffrau / zum Bankkaufmann
+  /zum Bankkaufmann\s*\/\s*zur Bankkauffrau/ => 'Bankkaufmann', # zum Bankkaufmann / zur Bankkauffrau
+  /Pflegefachmann\/zur Pflegefachfrau\/Pflegefachkraft/ => 'Pflegefachmann',
+  /Pflegefachfrau\s*\/\s*Pflegefachmann/ => 'Pflegefachmann', # Pflegefachfrau / Pflegefachmann
+  /Pflegefachmann\s*\/\s*Pflegefachfrau/ => 'Pflegefachmann', # Pflegefachmann / Pflegefachfrau
+  /Pflegefachkraft/ => 'Pflegefachmann',
+  /frau\/\s*-?\s*mann/ => 'mann', # frau/mann, frau/-mann, frau/ -mann, etc.
+  /\s*\/-?frau/ => '', # / -frau, /-frau and /frau
+  /:frau/ => '', # :frau
+  /\*frau/ => '', # *frau
+  /frau/ => '', # frau
+  /:in/ => '', # :in
+  /\/in/ => '', # /in
+  /\/-in/ => '', # /-in
+  /\*in/ => '', # *in
+  /(?<=\w)In/ => '', # In, e.g. FotografIn
+  /e\*r/ => 'er', # e*r
+  /\/-technologin/ => '', # /-technologin
+
+  # Fixing name and spelling variations and misspelling
+  /Kraftfahrzeugmechatroniker|KFZ-Mechatroniker/ => 'Kfz-Mechatroniker',
+  /ITSystemElektroniker|IT-System-Elektroniker/ => 'IT-Systemelektroniker',
+  /zumKaufmann/ => 'Kaufmann',
+  /Verkaeufer/ => 'Verkäufer',
+  /verkaeufer/ => 'verkäufer',
+  /Buero/ => 'Büro',
+  /Ausbildung\s*\/\s*Ausbildungsplatz/ => 'Ausbildung',
+  /Ausbildungsplatz/ => 'Ausbildung',
+  /Ausbildungsplätze für den Beruf/ => 'Ausbildung',
+  /Ausbildungsplätze/ => 'Ausbildung',
+  /Ausbildungsstelle/ => 'Ausbildung',
+  /Auszubildende/ => 'Ausbildung',
+  /Azubi \// => 'Ausbildung',
+  /Azubi/ => 'Ausbildung',
+
+  # Removing grammar, punctation and clutter
+  /^\d+\s*Ausbildung/ => 'Ausbildung', # 2024 Ausbildung
+  /Ausbildung -/ => 'Ausbildung', # Ausbildung -
+  /Ausbildung \// => 'Ausbildung', # Ausbildung /
+  /Ausbildung:/ => 'Ausbildung', # Ausbildung:
+  /Ausbildung \d{4}|Ausbildung \d{4}\s*[:!-]+/ => 'Ausbildung', # Ausbildung 2024,2024:, 2024!, etc.
+  /\d{2}[\.\/]\d{4}|\(?\d{4}\)|\(Start \d{4}\)|\(Start: \d{2}.\d{2}.\d{4}\)|\d{2}.\d{2}.\d{4}/ => '', # dd.dddd, dd/dddd, dddd, (dddd), (Start dddd), (Start: dd.dd.dddd),dd.dd.dddd
+  / als / => ' ',
+  / für | fuer / => ' ',
+  / im / => ' ',
+  /Ausbildung zum(?=\w)/ => 'Ausbildung ',
+  /zum\s*\/\s*zur/ => '', # zum/zur, zum / zur, zum/ zur, zum  / zur, etc.
+  /zur\s*\/\s*zum/ => '', # zur/zum, zur / zum, zur/ zum, zur  / zum, etc.
+  /zum\/r/ => '', # zum/r
+  /zum\/\-r/ => '', # zum/-r
+  /zur\/m/ => '', # zur/m
+  /zur\/-m/ => '', # zur/-m
+  /zum:zur/ => '', # zum:zur
+  /zur:zum/ => '', # zur:zum
+  /zur\*zum/ => '', # zur*zum
+  /zum\*zur/ => '', # zum*zur
+  / zum / => ' ',
+  / zur / => ' ',
+  / zu / => ' ',
+
+  # Cleaning up
+  /\s+/ => ' ', # Collapse multiple spaces
+  /^\s+|\s+$/ => "" # Trim spaces at the start and end of the title
+}
+
+def sanitize_job_title(job_title_original_dup)
+  TITLE_SANITATION_RULES.each do |regex_pattern, replacement|
+    job_title_original_dup.gsub!(regex_pattern, replacement)
+  end
+  
+  job_title_original_dup
+end
+
+def fetch_jobs(url, job_number, pages)
+  jobs = []
+  html = URI.open(url)
+  doc = Nokogiri::HTML(html)
+
+  # Each job card is within an <a> tag, that lives on top of the container element:
+  doc.css('.MuiBox-root.css-1uredn5 > a').each do |link|
+    job_number += 1
+    
+    # Begin job titles
+    job_title_original = link.at_css('[data-test-id="job-title"]').text.gsub(/[[:space:]]+/, ' ').strip
+    job_title_sanitized = sanitize_job_title(job_title_original.dup)
+    next unless job_title_sanitized.downcase.include?("ausbildung")
+    next if job_title_sanitized.downcase.include?("ohne ausbildung") || job_title_sanitized.downcase.include?("studium")
+    # End job titles
+    
+    job_count = "=COUNTIF(INDIRECT(ADDRESS(2;COLUMN()-2)):INDIRECT(ADDRESS(#{pages * 25};COLUMN()-2));INDIRECT(ADDRESS(ROW();COLUMN()-2)))"
+    job_link_original  = "=HYPERLINK(\"https://www.<JOBSITE>.co#{link['href']}\")"
+    job_link_sanitized = job_link_original.split('?').first + "\""
+    
+    # Begin salary split, creating salary_min_value, salary_min_currency, salary_max_value and salary_max_currency and bonus
+    salary, bonus = link.at_css('[data-test-id="salary-tag"]').text.gsub(/[[:space:]]+/, ' ').strip.split(' + ')
+    bonus = '' if bonus.nil?
+    salary_min, salary_max = salary.split(' - ')
+    if salary_max.nil?
+      salary_max = ''
+      salary_min_value, salary_min_currency = salary_min.split
+      salary_min_value = salary_min_value.gsub('.', '').to_i
+    else
+      salary_max_value, salary_max_currency = salary_max.split
+      salary_max_value = salary_max_value.gsub('.', '').to_i
+      salary_min_value = salary_min.split.first.gsub('.', '').to_i
+      salary_min_currency = salary_max_currency.dup
+    end
+    # End salary split
+    
+    ad_age_tag = link.at_css('[data-test-id="date"]') ? link.at_css('[data-test-id="date"]').text.strip : ''
+    company_name = link.at_css('[data-test-id="company-name"]').text.strip
+    location = link.at_css('[data-test-id="company-location"]').text.strip
+    easy_apply_tag = link.at_css('[data-test-id="easy-apply-tag"]') ? 'Kein Lebenslauf benötigt' : ''
+    required_experience = link.at_css('[data-test-id="required-experience-tag"]') ? link.at_css('[data-test-id="required-experience-tag"]').text.strip : ''
+    open_for_career_changers_tag = link.at_css('[data-test-id="open-for-career-changers"]') ? link.at_css('[data-test-id="open-for-career-changers"]').text.strip : ''
+    required_education_tag = link.at_css('[data-test-id="required-education-tag"]') ? link.at_css('[data-test-id="required-education-tag"]').text.strip : ''
+    working_hours = link.at_css('[data-test-id="working-hour-tag"]').text.strip
+    schedule_type_tag = link.at_css('[data-test-id="schedule-type-tag"]') ? link.at_css('[data-test-id="schedule-type-tag"]').text.strip : ''
+    shift_tag = link.at_css('[data-test-id="shift-tag"]') ? link.at_css('[data-test-id="shift-tag"]').text.strip : ''
+
+    jobs << [job_number, job_title_sanitized, job_title_original, job_count, job_link_sanitized, job_link_original, salary_min_value, salary_min_currency, salary_max_value, salary_max_currency, bonus, ad_age_tag, company_name, location, easy_apply_tag, required_experience, open_for_career_changers_tag, required_education_tag, working_hours, schedule_type_tag, shift_tag] # remember to update job_count LibreOffice calc formula for column reference to job_title_sanitized if sequence is changed
+  end
+
+  [jobs, job_number]
+end
+
+def break_countdown_clock(break_time)
+  last_message_length = 0
+  break_time.downto(0) do |remaining|
+    print "\r#{' ' * last_message_length}" # Overwriting the previous line with whitespace so not to have remainders of a previous message
+    message = "\rRemaining break time: #{remaining / 3600} hours, #{(remaining % 3600) / 60} minutes and #{remaining % 60} seconds."
+    last_message_length = message.length
+    print message
+    $stdout.flush # Other than puts, print can be buffered. This flushes the buffer, enforcing immediate output to the display without any delays
+    sleep(1)
+  end
+  print "\r#{' ' * last_message_length}"
+  puts "\rBreak over, resuming scraping..."
+end
+
+def simulate_natural_browsing_behavior(page)
+  # Session end: Take a long break every 51 pages to simulate stepping away from the computer for 10 Minutes to 1 hour
+  if page % 51 == 0
+    break_time = rand(600..3600)
+    puts "Session break. Stepping away for #{break_time / 60} minutes..."
+    break_countdown_clock(break_time)
+
+  # Reading pause: Simulating actually reading the content on every 9th page for 20 seconds to 3 minutes
+  elsif page % 9 == 0
+    break_time = rand(20..180)
+    puts "Taking a break of #{break_time / 60} minutes #{break_time % 60} seconds to read the page..."
+    break_countdown_clock(break_time)
+
+  # Quick browsing, clicking next page every 3 to 11 seconds
+  else
+    break_time = rand(3..11)
+    print "Clicking 'next page' in #{break_time} seconds..."
+    $stdout.flush
+    sleep(break_time)
+    puts
+  end
+end
+
+def scrape_jobs_to_csv(base_url, pages, filename)
+  puts 'scrape_<JOBSITE> v.2.0.5'
+  job_number = 0
+  CSV.open(filename, 'wb', col_sep: ";") do |csv|
+     csv << ['No.', 'Job Title (sanitized)', 'Job Title (original)', 'Job Count', 'Link <JOBSITE> (sanitized)', 'Link <JOBSITE> (original)', 'Salary min (value)', 'Salary min (currency)', 'Salary max (value)', 'Salary max (currency)', 'Bonus', 'Ad Age', 'Company Name', 'Company Location', 'Easy Apply', 'Required Experience', 'Career Changers', 'Required Education', 'Working hours', 'Schedule Type', 'Shift Type']
+    1.upto(pages) do |page|
+      print "Scraping page #{page} of #{pages}. "
+      full_url = "#{base_url}?page=#{page}&orderBy=date&salary=true" # Sorts by date (newest first) and filters for salary info existance
+      fetched_jobs, job_number = fetch_jobs(full_url, job_number, pages)
+      fetched_jobs.each { |job| csv << job }
+      simulate_natural_browsing_behavior(page) unless page == pages
+    end
+  end
+  puts "\nDone. Saved to #{filename}"
+end
+
+base_url = 'https://www.<JOBSITE>.de/de-de/jobs-fuer-Azubi-mit-Vollzeit'
+pages = 200
+filename = "#{Time.now.strftime('%Y-%m-%d_%H%M')}_<JOBSITE>_Ausbildungen-Vollzeit-mit_Gehaltsangabe.csv"
+
+scrape_jobs_to_csv(base_url, pages, filename)
