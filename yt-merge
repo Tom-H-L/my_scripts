@@ -1,0 +1,65 @@
+#!/usr/bin/env ruby
+
+require 'shellwords'
+require 'io/console'
+
+# Checking if FFmpeg is installed
+def ffmpeg_installed?
+  path = `which ffmpeg`.strip
+  !path.empty? && path.include?('/')
+end
+
+# Exiting unless FFmpeg is installed
+unless ffmpeg_installed?
+  puts "Error: FFmpeg is not installed or not in the PATH."
+  exit(1)
+end
+
+# Checking for file write permissions
+def writable_files?(*files)
+  files.all? { |file| File.writable?(file) }
+end
+
+# Delte the old files
+def delete_files(*files)
+  if writable_files?(*files)
+    files.each { |file| File.delete(file) if File.exist?(file) }
+    puts "Original files deleted."
+  else
+    puts "Insufficient permissions to delete the files."
+    exit(1)
+  end
+end
+
+# Merging the files
+def merge_files(video_file)
+  # Derive audio file name from video file name
+  audio_file = video_file.sub('DASH_V', 'DASH_A')
+
+  # Prepare output file name with .webm extension
+  output_file = video_file.sub(' - DASH_V', '')
+
+  # Construct FFmpeg command for WebM output with VP9 video and Opus audio  
+  cmd = "ffmpeg -i #{Shellwords.escape(video_file)} " +
+        "-i #{Shellwords.escape(audio_file)} " +
+        "-c:v copy -c:a copy #{Shellwords.escape(output_file)}"
+
+  # Execute the command
+  system(cmd)
+  puts "Files have been merged into #{output_file}"
+
+  # Ask if user wants to delete the original files
+  puts "Do you want to delete the original files? (y/n)"
+  answer = STDIN.getch
+
+  if answer.downcase == 'y'
+    delete_files(video_file, audio_file)
+  end
+end
+
+# Call the function with ARGV[0] if a file name is provided
+if ARGV.length != 1
+  puts "Usage: yt-merge video_file_name"
+else
+  merge_files(ARGV[0])
+end
